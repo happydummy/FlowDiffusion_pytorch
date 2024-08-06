@@ -28,14 +28,14 @@ from accelerate.utils import (
     SCALER_NAME,
     SCHEDULER_NAME,
     get_pretty_name,
-    is_tpu_available,
+    # is_tpu_available,
     is_xpu_available,
     save,
 )
 
 
-if is_tpu_available(check_device=False):
-    import torch_xla.core.xla_model as xm
+# if is_tpu_available(check_device=False):
+    # import torch_xla.core.xla_model as xm
 
 from accelerate.logging import get_logger
 from accelerate.state import PartialState

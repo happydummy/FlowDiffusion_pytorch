@@ -1054,7 +1054,7 @@ class Unet(nn.Module):
             sample_size=256,
             dim_mults=(1, 2, 4, 8),
             cond_images_channels=0,
-            channels=8,
+            channels=10,
             channels_out=2,
             attn_dim_head=64,
             attn_heads=8,

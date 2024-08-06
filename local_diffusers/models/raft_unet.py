@@ -26,6 +26,8 @@ from core.extractor import BasicEncoder
 from .imagen_unet import Unet, exists, UNet2DOutput
 from core.utils.utils import bilinear_sampler, coords_grid, downflow8
 from core.corr import CorrBlock
+from .init_pre import predictor
+from configs.parser import parse_args
 try:
     from xformers.ops import memory_efficient_attention, unbind, fmha
 
@@ -41,12 +43,14 @@ try:
 except ImportError:
     print("FLASH ATTENTION2 not available")
     FLASH_AVAILABLE = False
+    
+from rddm import ResidualDiffusion
 
 
 # predefined unets, with configs lining up with hyperparameters in appendix of paper
-class RAFT_Unet(Unet, ModelMixin, ConfigMixin):
+class RAFT_Unet(Unet, ResidualDiffusion, ModelMixin, ConfigMixin):
     @register_to_config
-    def __init__(self, channels, channels_out, sample_size, add_dim=(0, 0, 324, 0), corr_index='noised_flow', **kwargs):
+    def __init__(self, channels, channels_out, sample_size, model_cfg, add_dim=(0, 0, 324, 0), corr_index='noised_flow', **kwargs):
         default_kwargs = dict(
             channels=channels,
             channels_out=channels_out,
@@ -66,6 +70,9 @@ class RAFT_Unet(Unet, ModelMixin, ConfigMixin):
 
         # feature encoder
         self.fnet = BasicEncoder(output_dim=256, norm_fn='instance', dropout=0.0)
+
+        model_cfg = parse_args(model_cfg)
+        self.cnet = predictor(args=model_cfg)
         print('[fnet: BasicEncoder]')
         assert self.corr_index in ['orginal', 'noised_flow', None]
         print('[corr_index: ', self.corr_index, ']')
@@ -73,21 +80,32 @@ class RAFT_Unet(Unet, ModelMixin, ConfigMixin):
     def forward(
             self,
             sample: torch.FloatTensor,
+            noise_scheduler,
             timestep: Union[torch.Tensor, float, int],
+            valid,
             class_labels: Optional[torch.Tensor] = None,
             return_dict: bool = True,
             normalize=False,
     ):
         time = timestep
-
         x = sample
 
-        # encoder feature
-        image1, image2 = x[:, :3], x[:, 3:6]
+        image1, image2, flow_gt = x[:, :3], x[:, 3:6], x[:, 6:9]
+        image1 = 2 * (image1 / 255.0) - 1.0
+        image2 = 2 * (image2 / 255.0) - 1.0
+        image1 = image1.contiguous()
+        image2 = image2.contiguous()
+        
+        init, init_loss = self.cnet(torch.cat([image1 , image2], dim=1), flow_gt)
+        res = init - flow_gt
+        
+        noise = torch.randn(flow_gt.shape, dtype=torch.float32).to(flow_gt.device)         
+        noisy_target = noise_scheduler.q_sample(flow_gt, res, time, noise)
+        x = torch.cat([image1, image2, res, noisy_target], dim=1)
+                     
         fmap1, fmap2 = self.fnet([image1, image2])
         fmap1 = fmap1.float()
-        fmap2 = fmap2.float()
-
+        fmap2 = fmap2.float()       
         corr_fn = CorrBlock(fmap1, fmap2, radius=4)
         N, C, H, W = image1.shape
         coords1 = coords_grid(N, H // 8, W // 8, device=image1.device)
@@ -101,7 +119,7 @@ class RAFT_Unet(Unet, ModelMixin, ConfigMixin):
         corr = corr_fn(coords1)  # index correlation volume
 
         # initial convolution
-        x = self.init_conv(x)
+        x = self.init_conv(x)           #in channel = 10
         # init conv residual
 
         if self.init_conv_to_final_conv_residual:
@@ -111,7 +129,7 @@ class RAFT_Unet(Unet, ModelMixin, ConfigMixin):
         if len(time.shape) == 0:
             time = time.reshape(1).repeat(sample.shape[0])
         time = time.to(x.device)
-
+        time = noise_scheduler.alphas_cumsum[timestep] * noise_scheduler.num_timesteps
         time_hiddens = self.to_time_hiddens(time)
 
         # derive time tokens
@@ -197,7 +215,16 @@ class RAFT_Unet(Unet, ModelMixin, ConfigMixin):
         if exists(self.final_res_block):
             x = self.final_res_block(x, t)
 
-        x = self.final_conv(x)
+        pred_res = self.final_conv(x)
         if normalize:
-            x = torch.tanh(x)
-        return UNet2DOutput(sample=x)
+            pred_res = torch.tanh(pred_res)
+        # return UNet2DOutput(sample=x)
+        pred_noise = self.predict_noise_from_res(noisy_target, timestep, init, pred_res)
+        pred = self.q_posterior_from_res_noise(pred_res, pred_noise, pred_res, timestep)   
+        
+        if self.training:
+            nosie_loss = valid[:, None] * (pred_res - res).abs()
+            total_loss = 0.7 * init_loss +  nosie_loss           
+            return total_loss, pred, pred_res, pred_noise
+        else:
+            return x, res
